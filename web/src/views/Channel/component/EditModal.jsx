@@ -67,6 +67,7 @@ const getValidationSchema = (t) =>
     type: Yup.number().required(t('channel_edit.requiredChannel')),
     key: Yup.string().when('is_edit', { is: false, then: Yup.string().required(t('channel_edit.requiredKey')) }),
     other: Yup.string(),
+    remark: Yup.string(),
     proxy: Yup.string(),
     test_model: Yup.string(),
     models: Yup.array().min(1, t('channel_edit.requiredModels')),
@@ -79,7 +80,8 @@ const getValidationSchema = (t) =>
     model_mapping: Yup.array(),
     model_headers: Yup.array(),
     header_override: Yup.array(),
-    custom_parameter: Yup.string().nullable()
+    custom_parameter: Yup.string().nullable(),
+    need2response_models: Yup.string().nullable()
   });
 
 const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, groupMap, isTag, modelOptions, prices, tags }) => {
@@ -1001,6 +1003,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, groupMap, is
           data.custom_parameter = '';
         }
 
+        data.need2response_models = data.need2response_models ?? '';
         data.base_url = data.base_url ?? '';
         data.cost_ratio = data.cost_ratio ?? 0;
         data.is_edit = true;
@@ -1159,6 +1162,32 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, groupMap, is
                       );
                     })()}
                   </FormControl>
+
+                  {!isTag && (
+                    <FormControl fullWidth error={Boolean(touched.remark && errors.remark)} sx={{ ...theme.typography.otherInput }}>
+                      <InputLabel htmlFor="channel-remark-label">{customizeT(inputLabel.remark)}</InputLabel>
+                      <OutlinedInput
+                        id="channel-remark-label"
+                        label={customizeT(inputLabel.remark)}
+                        type="text"
+                        value={values.remark}
+                        name="remark"
+                        onBlur={handleBlur}
+                        onChange={handleChange}
+                        multiline
+                        minRows={2}
+                        inputProps={{}}
+                        aria-describedby="helper-text-channel-remark-label"
+                      />
+                      {touched.remark && errors.remark ? (
+                        <FormHelperText error id="helper-tex-channel-remark-label">
+                          {errors.remark}
+                        </FormHelperText>
+                      ) : (
+                        <FormHelperText id="helper-tex-channel-remark-label"> {customizeT(inputPrompt.remark)} </FormHelperText>
+                      )}
+                    </FormControl>
+                  )}
 
                   {inputPrompt.base_url && (
                     <FormControl fullWidth error={Boolean(touched.base_url && errors.base_url)} sx={{ ...theme.typography.otherInput }}>
@@ -1799,6 +1828,34 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, groupMap, is
                         </FormHelperText>
                       ) : (
                         <FormHelperText id="helper-tex-channel-model_mapping-label">{customizeT(inputPrompt.model_mapping)}</FormHelperText>
+                      )}
+                    </FormControl>
+                  )}
+
+                  {inputPrompt.need2response_models && (
+                    <FormControl
+                      fullWidth
+                      error={Boolean(touched.need2response_models && errors.need2response_models)}
+                      sx={{ ...theme.typography.otherInput }}
+                    >
+                      <TextField
+                        multiline
+                        minRows={6}
+                        id="channel-need2response_models-label"
+                        name="need2response_models"
+                        label={customizeT(inputLabel.need2response_models)}
+                        value={values.need2response_models || ''}
+                        onBlur={handleBlur}
+                        onChange={handleChange}
+                      />
+                      {touched.need2response_models && errors.need2response_models ? (
+                        <FormHelperText error id="helper-tex-channel-need2response_models-label">
+                          {errors.need2response_models}
+                        </FormHelperText>
+                      ) : (
+                        <FormHelperText id="helper-tex-channel-need2response_models-label">
+                          {customizeT(inputPrompt.need2response_models)}
+                        </FormHelperText>
                       )}
                     </FormControl>
                   )}

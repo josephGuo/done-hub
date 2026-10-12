@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"done-hub/common"
 	"done-hub/common/config"
 	"done-hub/common/logger"
 	"done-hub/common/model_utils"
@@ -33,7 +34,7 @@ var (
 	noSupportRegex  = regexp.MustCompile(`(?:^tts|rerank|whisper|speech|^mj_|^chirp)`)
 )
 
-func testChannel(channel *model.Channel, testModel string) (openaiErr *types.OpenAIErrorWithStatusCode, err error) {
+func testChannel(channel *model.Channel, testModel string, endpointType string) (openaiErr *types.OpenAIErrorWithStatusCode, err error) {
 	if testModel == "" {
 		testModel = channel.TestModel
 		if testModel == "" {
@@ -50,7 +51,7 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		testModel = parts[0]
 	}
 
-	channelType := getModelType(testModel)
+	channelType := resolveTestChannelType(endpointType, testModel)
 	channel.SetProxy()
 
 	var url string
@@ -139,6 +140,14 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 
 		response, openAIErrorWithStatusCode = responseProvider.CreateResponses(testRequest)
 	case "chat":
+		if channel.ShouldUseResponsesForModel(newModelName) {
+			responseProvider, ok := provider.(providers_base.ResponsesInterface)
+			if ok {
+				response, openAIErrorWithStatusCode = createChatResponsesForTest(responseProvider, newModelName)
+				break
+			}
+		}
+
 		// 仅实现 Claude 原生 Messages 接口的渠道（如 Bedrock Messages）不满足 ChatInterface，
 		// 回退到 Claude 接口测速。
 		if chatProvider, ok := provider.(providers_base.ChatInterface); ok {
@@ -211,6 +220,77 @@ func getModelType(modelName string) string {
 	return "chat"
 }
 
+// resolveTestChannelType 解析测速请求要走的端点类型。
+// 显式传入 endpoint_type（chat/embeddings/image/response）时以调用方为准，用于模型名推断不出实际端点的情况；
+// 其余值回退到按模型名推断。
+func resolveTestChannelType(endpointType string, testModel string) string {
+	endpointType = strings.TrimSpace(endpointType)
+	switch endpointType {
+	case "chat", "embeddings", "image", "response":
+		return endpointType
+	default:
+		return getModelType(testModel)
+	}
+}
+
+// createChatResponsesForTest 按 relay 的 chat→Responses 兼容路径测速。
+// pro / deep-research 类模型非流式完整生成可能超出测速超时，故走流式，收到首个非空事件即视为可用。
+func createChatResponsesForTest(responseProvider providers_base.ResponsesInterface, modelName string) (any, *types.OpenAIErrorWithStatusCode) {
+	chatRequest := &types.ChatCompletionRequest{
+		Messages: []types.ChatCompletionMessage{
+			{
+				Role:    "user",
+				Content: "You just need to output 'hi' next.",
+			},
+		},
+		Model:  modelName,
+		Stream: true,
+	}
+	streamRequest := chatRequest.ToResponsesRequest()
+	streamRequest.ConvertChat = true
+
+	stream, streamErr := responseProvider.CreateResponsesStream(streamRequest)
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	defer stream.Close()
+
+	dataChan, errChan := stream.Recv()
+	timeout := time.NewTimer(15 * time.Second)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				return nil, common.StringErrorWrapperLocal("responses stream has no data", "no_response", http.StatusInternalServerError)
+			}
+
+			if strings.TrimSpace(data) == "" {
+				continue
+			}
+
+			return map[string]any{
+				"model": modelName,
+				"mode":  "chat_to_responses_stream",
+				"ok":    true,
+			}, nil
+		case readErr, ok := <-errChan:
+			if !ok {
+				// errChan 已关闭；将其置 nil 使该 case 永久阻塞，
+				// 避免关闭后的 channel 每轮 select 都立即可选，形成忙等循环。
+				errChan = nil
+				continue
+			}
+			if readErr != nil {
+				return nil, common.ErrorWrapperLocal(readErr, "stream_read_failed", http.StatusInternalServerError)
+			}
+		case <-timeout.C:
+			return nil, common.StringErrorWrapperLocal("responses stream test timeout", "stream_timeout", http.StatusGatewayTimeout)
+		}
+	}
+}
+
 func TestChannel(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -229,26 +309,20 @@ func TestChannel(c *gin.Context) {
 		return
 	}
 	testModel := c.Query("model")
+	endpointType := c.Query("endpoint_type")
 	tik := time.Now()
-	openaiErr, err := testChannel(channel, testModel)
+	_, err = testChannel(channel, testModel, endpointType)
 	tok := time.Now()
 	milliseconds := tok.Sub(tik).Milliseconds()
 	consumedTime := float64(milliseconds) / 1000.0
 
-	success := false
-	msg := ""
-	if openaiErr != nil {
-		if ShouldDisableChannel(channel.Type, openaiErr) {
-			msg = fmt.Sprintf("测速失败，已被禁用，原因：%s", utils.MaskSensitiveInfo(err.Error()))
-			DisableChannel(channel.Id, channel.Name, testModel, err.Error(), false)
-		} else {
-			msg = fmt.Sprintf("测速失败，原因：%s", utils.MaskSensitiveInfo(err.Error()))
-		}
-	} else if err != nil {
+	// 手动测速只做诊断，不自动禁用渠道：多模型批量测试时单个模型失败不应连带禁用整个渠道。
+	// testChannel 返回非空 openaiErr 时 err 必非空，只需判断 err。
+	success := err == nil
+	msg := "测速成功"
+	if !success {
 		msg = fmt.Sprintf("测速失败，原因：%s", utils.MaskSensitiveInfo(err.Error()))
 	} else {
-		success = true
-		msg = "测速成功"
 		go channel.UpdateResponseTime(milliseconds)
 	}
 
@@ -276,7 +350,7 @@ func testChannelWithTimeout(channel *model.Channel, testModel string, timeout ti
 	}
 	ch := make(chan result, 1)
 	go func() {
-		openaiErr, err := testChannel(channel, testModel)
+		openaiErr, err := testChannel(channel, testModel, "")
 		ch <- result{openaiErr, err}
 	}()
 	timer := time.NewTimer(timeout)

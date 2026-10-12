@@ -83,18 +83,6 @@ func (r *relayChat) forcePromptTokens() int {
 	return common.CountTokenMessages(r.chatRequest.Messages, r.modelName, config.PreCostDefault)
 }
 
-var need2Response = map[string]bool{
-	"o3-pro-2025-06-10":                true,
-	"o3-pro":                           true,
-	"o1-pro-2025-03-19":                true,
-	"o1-pro":                           true,
-	"o3-deep-research-2025-06-26":      true,
-	"o3-deep-research":                 true,
-	"o4-mini-deep-research-2025-06-26": true,
-	"o4-mini-deep-research":            true,
-	"codex-mini-latest":                true,
-}
-
 func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	// 图像生成模型走 chat 入口是非标用法，按 chat 协议处理会把上游 base64 当文本反算成百万级 token、
 	// 计费爆炸；在 chat 入口分流到 image generations 协议做渠道降级。
@@ -110,9 +98,11 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 		return
 	}
 
-	if need2Response[r.modelName] {
-		resProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		if ok {
+	// chat→Responses 路由：渠道单独配置了 Need2ResponseModels 时以其为准，
+	// 未配置的渠道回退到全局默认表（见 model.ShouldUseResponsesForModel）。
+	channel := r.provider.GetChannel()
+	if channel != nil && channel.ShouldUseResponsesForModel(r.modelName) {
+		if resProvider, ok := r.provider.(providersBase.ResponsesInterface); ok {
 			return r.compatibleSend(resProvider)
 		}
 	}
@@ -372,7 +362,13 @@ func writeChatStreamFrame(c *gin.Context, chunk types.ChatCompletionStreamRespon
 }
 
 func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+	// 响应要由 Responses 转回 chat 格式，不能字节直返。按渠道路由后同一请求重试时可能先走过 chat 分支
+	// 设过放行 key=true，此处显式关闭，避免 CreateResponses 误读残留许可把 responses 原始字节直返给 chat 客户端。
+	r.c.Set(config.GinRawPassThroughAllowedKey, false)
+
 	resRequest := r.chatRequest.ToResponsesRequest()
+	// chatRequest.Model 仍是客户端原始名（映射名只在 chat 分支回写），需显式用渠道映射后的模型名，与 compatibleSendImage 对称
+	resRequest.Model = r.modelName
 	resRequest.ConvertChat = true
 
 	if r.chatRequest.Stream {
