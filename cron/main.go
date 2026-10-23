@@ -5,7 +5,7 @@ import (
 	"done-hub/common/logger"
 	"done-hub/common/scheduler"
 	"done-hub/model"
-	"fmt"
+	"errors"
 	"github.com/spf13/viper"
 	"time"
 
@@ -64,28 +64,9 @@ func InitCron() {
 	err = scheduler.Manager.AddJob(
 		"log_auto_delete",
 		gocron.DailyJob(1, gocron.NewAtTimes(gocron.NewAtTime(3, 0, 0))),
-		gocron.NewTask(func() {
-			if !config.LogAutoDeleteEnabled || config.LogAutoDeleteDays <= 0 {
-				return
-			}
-			targetTimestamp := time.Now().AddDate(0, 0, -config.LogAutoDeleteDays).Unix()
-			const batchSize = 10000
-			var totalDeleted int64
-			for {
-				affected, err := model.DeleteOldLogBatch(targetTimestamp, batchSize)
-				if err != nil {
-					logger.SysError(fmt.Sprintf("[cron] 消费日志自动清理失败，已删 %d 行: %v", totalDeleted, err))
-					break
-				}
-				totalDeleted += affected
-				if affected == 0 {
-					break
-				}
-			}
-			if totalDeleted > 0 {
-				logger.SysLog(fmt.Sprintf("[cron] 消费日志自动清理完成，共删除 %d 行", totalDeleted))
-			}
-		}),
+		gocron.NewTask(autoDeleteLogs),
+		// 积压多时单次清理可能持续数小时，禁止与下一次触发重叠
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
 	)
 	if err != nil {
 		logger.SysError("Cron job error: " + err.Error())
@@ -124,5 +105,16 @@ func InitCron() {
 	if err != nil {
 		logger.SysError("Cron job error: " + err.Error())
 		return
+	}
+}
+
+// autoDeleteLogs 按保留天数清理过期消费日志，分批/重试/进度日志由 model.DeleteOldLogs 统一处理。
+func autoDeleteLogs() {
+	if !config.LogAutoDeleteEnabled || config.LogAutoDeleteDays <= 0 {
+		return
+	}
+	targetTimestamp := time.Now().AddDate(0, 0, -config.LogAutoDeleteDays).Unix()
+	if _, err := model.DeleteOldLogs("cron", targetTimestamp); errors.Is(err, model.ErrLogCleanupRunning) {
+		logger.SysLog("[cron] 已有消费日志清理在执行（可能是手动触发），跳过本次")
 	}
 }
